@@ -1,0 +1,356 @@
+name: 🚀 CI/CD Pipeline
+
+on:
+  push:
+    branches: [ master, develop ]
+  pull_request:
+    branches: [ master, develop ]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18'
+  JAVA_VERSION: '17'
+  MAVEN_OPTS: -Xmx1024m
+
+jobs:
+  # Frontend Tests and Build
+  frontend-tests:
+    name: 🌐 Frontend Tests & Build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 📋 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🔧 Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+        
+    - name: 📦 Install Dependencies
+      working-directory: ./frontend
+      run: npm ci
+      
+    - name: 🧪 Run Tests
+      working-directory: ./frontend
+      run: |
+        npm run test:coverage
+        npm run test:ci
+      
+    - name: 🔍 Lint Code
+      working-directory: ./frontend
+      run: |
+        npm run lint
+        npm run lint:css
+        
+    - name: 🏗️ Build Application
+      working-directory: ./frontend
+      run: npm run build
+      
+    - name: 📊 Upload Coverage Reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./frontend/coverage/lcov.info
+        flags: frontend
+        name: frontend-coverage
+        
+    - name: 📦 Archive Build Artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: frontend-dist
+        path: frontend/dist/
+        retention-days: 7
+
+  # Backend Tests and Build
+  backend-tests:
+    name: ☕ Backend Tests & Build
+    runs-on: ubuntu-latest
+    
+    services:
+      oracle:
+        image: container-registry.oracle.com/database/express:21.3.0-xe
+        env:
+          ORACLE_PWD: password123
+          ORACLE_CHARACTERSET: AL32UTF8
+        options: >-
+          --health-cmd="sh -c 'echo "SELECT 1 FROM DUAL;" | sqlplus -s sys/password123@//localhost:1521/XE as sysdba'"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+        ports:
+          - 1521:1521
+          
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - name: 📋 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: ☕ Setup Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: 'temurin'
+        cache: maven
+        
+    - name: 🛠️ Cache Maven Dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+        
+    - name: 🧪 Run Unit Tests
+      working-directory: ./backend
+      run: |
+        mvn clean test
+        mvn test-compile
+      env:
+        SPRING_PROFILES_ACTIVE: test
+        SPRING_DATASOURCE_URL: jdbc:oracle:thin:@localhost:1521:XE
+        SPRING_DATASOURCE_USERNAME: sys as sysdba
+        SPRING_DATASOURCE_PASSWORD: password123
+        SPRING_REDIS_HOST: localhost
+        SPRING_REDIS_PORT: 6379
+        
+    - name: 🔍 Run Integration Tests
+      working-directory: ./backend
+      run: mvn verify -P integration-tests
+      env:
+        SPRING_PROFILES_ACTIVE: integration
+        SPRING_DATASOURCE_URL: jdbc:oracle:thin:@localhost:1521:XE
+        SPRING_DATASOURCE_USERNAME: sys as sysdba
+        SPRING_DATASOURCE_PASSWORD: password123
+        SPRING_REDIS_HOST: localhost
+        SPRING_REDIS_PORT: 6379
+        
+    - name: 🏗️ Build Application
+      working-directory: ./backend
+      run: mvn clean package -DskipTests
+      
+    - name: 📊 Generate Test Reports
+      working-directory: ./backend
+      run: mvn jacoco:report
+      
+    - name: 📊 Upload Coverage Reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./backend/target/site/jacoco/jacoco.xml
+        flags: backend
+        name: backend-coverage
+        
+    - name: 📦 Archive JAR
+      uses: actions/upload-artifact@v3
+      with:
+        name: backend-jar
+        path: backend/target/*.jar
+        retention-days: 7
+
+  # Code Quality Analysis
+  code-quality:
+    name: 🔍 Code Quality Analysis
+    runs-on: ubuntu-latest
+    needs: [frontend-tests, backend-tests]
+    
+    steps:
+    - name: 📋 Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Shallow clones should be disabled for better analysis
+        
+    - name: ☕ Setup Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: 'temurin'
+        
+    - name: 🔧 Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+        
+    - name: 📦 Install Frontend Dependencies
+      working-directory: ./frontend
+      run: npm ci
+      
+    - name: 🧪 Run Frontend Tests for Coverage
+      working-directory: ./frontend
+      run: npm run test:coverage
+      
+    - name: 🧪 Run Backend Tests for Coverage
+      working-directory: ./backend
+      run: mvn clean test jacoco:report
+      
+    - name: 🔍 SonarCloud Scan
+      uses: sonarcloud-github-action@master
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      with:
+        args: >
+          -Dsonar.projectKey=bhanu-1902_real-time-collaborative-workspace
+          -Dsonar.organization=bhanu-1902
+          -Dsonar.sources=frontend/src,backend/src/main
+          -Dsonar.tests=frontend/src,backend/src/test
+          -Dsonar.javascript.lcov.reportPaths=frontend/coverage/lcov.info
+          -Dsonar.java.binaries=backend/target/classes
+          -Dsonar.coverage.jacoco.xmlReportPaths=backend/target/site/jacoco/jacoco.xml
+
+  # Security Scanning
+  security-scan:
+    name: 🛡️ Security Scan
+    runs-on: ubuntu-latest
+    needs: [frontend-tests, backend-tests]
+    
+    steps:
+    - name: 📋 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🔍 Run Snyk Security Scan
+      uses: snyk/actions/setup@master
+      
+    - name: 🔍 Snyk Frontend Scan
+      working-directory: ./frontend
+      run: |
+        npm ci
+        snyk test --severity-threshold=medium
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        
+    - name: 🔍 Snyk Backend Scan
+      working-directory: ./backend
+      run: snyk test --severity-threshold=medium
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        
+    - name: 🔍 OWASP Dependency Check
+      uses: dependency-check/Dependency-Check_Action@main
+      with:
+        project: 'real-time-collaborative-workspace'
+        path: '.'
+        format: 'ALL'
+        
+    - name: 📦 Upload OWASP Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: owasp-report
+        path: reports/
+        retention-days: 7
+
+  # Docker Build and Push
+  docker-build:
+    name: 🐳 Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: [code-quality, security-scan]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: 📋 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 📦 Download Frontend Artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: frontend-dist
+        path: frontend/dist/
+        
+    - name: 📦 Download Backend Artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: backend-jar
+        path: backend/target/
+        
+    - name: 🔑 Login to DockerHub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+        
+    - name: 🏗️ Build and Push Frontend Image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./frontend
+        file: ./frontend/Dockerfile
+        push: true
+        tags: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/rtcw-frontend:${{ github.sha }}
+          ${{ secrets.DOCKERHUB_USERNAME }}/rtcw-frontend:latest
+          
+    - name: 🏗️ Build and Push Backend Image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        file: ./backend/Dockerfile
+        push: true
+        tags: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/rtcw-backend:${{ github.sha }}
+          ${{ secrets.DOCKERHUB_USERNAME }}/rtcw-backend:latest
+
+  # Performance Testing
+  performance-test:
+    name: 📈 Performance Testing
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.ref == 'refs/heads/master'
+    
+    steps:
+    - name: 📋 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🚀 Setup k6
+      uses: grafana/k6-action@v0.3.1
+      with:
+        filename: performance-tests/load-test.js
+        
+    - name: 📦 Upload Performance Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-report
+        path: performance-results.json
+        retention-days: 7
+
+  # Deployment to Staging
+  deploy-staging:
+    name: 🚀 Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: 📋 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🚀 Deploy to Staging
+      run: |
+        echo "Deploying to staging environment..."
+        # Add your staging deployment commands here
+        
+  # Deployment to Production
+  deploy-production:
+    name: 🎆 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [performance-test]
+    if: github.ref == 'refs/heads/master'
+    environment: production
+    
+    steps:
+    - name: 📋 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🎆 Deploy to Production
+      run: |
+        echo "Deploying to production environment..."
+        # Add your production deployment commands here
